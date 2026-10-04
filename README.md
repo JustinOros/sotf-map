@@ -8,6 +8,19 @@ yellow arrow, other players are blue arrows with their names, Kelvin is his K
 and Virginia is her heart. Everything your GPS shows is on the map too, such as
 discovered caves, GPS locators and other points of interest.
 
+## Waypoints
+
+While the map is open the mouse cursor is free. Left click anywhere on the map to
+set a waypoint, left click it again or right click to clear it. Your waypoint is
+yellow. It also shows in the world as a pin with the distance to it, visible
+through trees and terrain.
+
+In multiplayer your waypoint is shared through the game chat. Players with the
+mod see it on their map and in the world in your color, which matches your arrow
+on their map, and the chat line is hidden for them. Players without the mod see
+a chat line with the coordinates. Each player has one waypoint at a time and
+waypoints clear themselves after 5 minutes.
+
 ## The M key
 
 In the base game M raises the GPS tracker. With this mod installed a quick press
@@ -70,6 +83,8 @@ Run the installer again. It replaces the old version.
 | --- | --- |
 | `M` | Opens and closes the full map |
 | Hold `M` | Switches M between the map and the GPS |
+| Left click on the map | Sets your waypoint, or clears it if you click it |
+| Right click on the map | Clears your waypoint |
 | Mouse wheel | Zooms in and out around your position |
 
 The map closes by itself when you open a menu, the console or chat.
