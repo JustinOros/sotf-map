@@ -836,7 +836,8 @@ public class Map : SonsMod
         sb.AppendLine($"==== mapprobe {mode} {DateTime.Now:HH:mm:ss}");
         try
         {
-            if (mode == "types") ProbeTypes(sb);
+            if (mode == "types") ProbeTypes(sb, new[] { "gpslocator", "gpsmarker", "gpspin" });
+            else if (mode == "chat") ProbeTypes(sb, new[] { "chat" });
             else ProbeLocators(sb);
         }
         catch (Exception e)
@@ -912,7 +913,7 @@ public class Map : SonsMod
         }
     }
 
-    private static void ProbeTypes(StringBuilder sb)
+    private static void ProbeTypes(StringBuilder sb, string[] filters)
     {
         var total = 0;
         foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
@@ -925,7 +926,7 @@ public class Map : SonsMod
             foreach (var t in types)
             {
                 var n = t.Name.ToLowerInvariant();
-                if (!n.Contains("gpslocator") && !n.Contains("gpsmarker") && !n.Contains("gpspin")) continue;
+                if (!filters.Any(f => n.Contains(f))) continue;
                 if (n.Contains("<") || n.Contains("__")) continue;
                 if (++total > 40) return;
                 sb.AppendLine($"== {an} {t.FullName}");
