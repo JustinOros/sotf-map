@@ -525,7 +525,7 @@ public class Map : SonsMod
     {
         try
         {
-            var harmony = new Harmony("JustinOros.Map");
+            var harmony = new HarmonyLib.Harmony("JustinOros.Map");
             var target = AccessTools.Method(typeof(ChatBox), "AddLine");
             var prefix = typeof(Map).GetMethod(nameof(AddLinePrefix), BindingFlags.NonPublic | BindingFlags.Static);
             harmony.Patch(target, new HarmonyMethod(prefix));
