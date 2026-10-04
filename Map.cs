@@ -1,8 +1,11 @@
 using RedLoader;
+using System.Reflection;
+using System.Text;
 using RedLoader.Utils;
 using Sons.Ai.Vail;
 using Sons.Gameplay.GPS;
 using SonsSdk;
+using SonsSdk.Attributes;
 using TheForest.Utils;
 using UnityEngine;
 using UnityEngine.InputSystem;
@@ -825,4 +828,141 @@ public class Map : SonsMod
             if (m.Rect) UnityEngine.Object.Destroy(m.Rect.gameObject);
         Markers.Clear();
     }
+    [DebugCommand("mapprobe")]
+    private static void ProbeCommand(string args)
+    {
+        var sb = new StringBuilder();
+        var mode = (args ?? string.Empty).Trim().ToLowerInvariant();
+        sb.AppendLine($"==== mapprobe {mode} {DateTime.Now:HH:mm:ss}");
+        try
+        {
+            if (mode == "types") ProbeTypes(sb);
+            else ProbeLocators(sb);
+        }
+        catch (Exception e)
+        {
+            sb.AppendLine($"ERROR {e}");
+        }
+        var file = Path.Combine(LoaderEnvironment.UserDataDirectory, "MapProbe.txt");
+        File.AppendAllText(file, sb.ToString());
+        SonsTools.ShowMessage($"mapprobe {mode} done");
+        RLog.Msg($"mapprobe wrote {sb.Length} chars to {file}");
+    }
+
+    private static void ProbeLocators(StringBuilder sb)
+    {
+        var player = LocalPlayer.Transform;
+        if (player) sb.AppendLine($"player {V3(player.position)}");
+        sb.AppendLine($"bolt running={BoltNetwork.isRunning} server={BoltNetwork.isServer} client={BoltNetwork.isClient}");
+
+        GPSTrackerSystem source = null;
+        var best = -1;
+        foreach (var t in Resources.FindObjectsOfTypeAll<GPSTrackerSystem>())
+        {
+            if (!t || t._gpsLocators == null) continue;
+            if (t._gpsLocators.Count <= best) continue;
+            best = t._gpsLocators.Count;
+            source = t;
+        }
+        if (!source)
+        {
+            sb.AppendLine("no GPSTrackerSystem with locators");
+            return;
+        }
+
+        var locators = source._gpsLocators;
+        var visuals = source._gpsLocatorVisuals;
+        sb.AppendLine($"locators {locators.Count} visuals {(visuals == null ? -1 : visuals.Count)} from {PathOf(source.transform)}");
+        var dumped = false;
+        for (var i = 0; i < locators.Count; i++)
+        {
+            var loc = locators[i];
+            if (!loc) continue;
+            var tr = loc.transform;
+            var root = tr.root;
+            var dist = player ? Vector3.Distance(player.position, tr.position) : -1f;
+            var icon = string.Empty;
+            if (visuals != null && i < visuals.Count && visuals[i])
+            {
+                var v = visuals[i];
+                foreach (var ri in v.GetComponentsInChildren<RawImage>(true))
+                    if (ri && ri.texture && ri.gameObject.activeInHierarchy && !ri.texture.name.EndsWith("Outline") && ri.texture.name != "Circle")
+                    {
+                        icon = ri.texture.name;
+                        break;
+                    }
+                icon += v.gameObject.activeSelf ? " shown" : " hidden";
+            }
+            sb.AppendLine($"-- [{i}] {loc.GetIl2CppType().FullName} path={PathOf(tr)} pos={V3(tr.position)} dist={dist:F0} active={tr.gameObject.activeInHierarchy} icon={icon}");
+            sb.AppendLine($"   root components: {Components(root)}");
+            if (tr != root) sb.AppendLine($"   locator components: {Components(tr)}");
+            var entity = root.GetComponentInChildren<BoltEntity>(true);
+            if (entity)
+            {
+                string info;
+                try { info = $"attached={entity.isAttached} owner={entity.isOwner} control={entity.hasControl} prefab={entity.prefabId}"; }
+                catch (Exception e) { info = $"<{e.GetType().Name}>"; }
+                sb.AppendLine($"   bolt {PathOf(entity.transform)} {info}");
+            }
+            if (!dumped)
+            {
+                dumped = true;
+                DumpMembers(sb, loc.GetType());
+            }
+        }
+    }
+
+    private static void ProbeTypes(StringBuilder sb)
+    {
+        var total = 0;
+        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            var an = asm.GetName().Name ?? string.Empty;
+            if (!an.StartsWith("Sons") && !an.StartsWith("Assembly-CSharp")) continue;
+            Type[] types;
+            try { types = asm.GetTypes(); }
+            catch (ReflectionTypeLoadException e) { types = e.Types.Where(x => x != null).ToArray(); }
+            foreach (var t in types)
+            {
+                var n = t.Name.ToLowerInvariant();
+                if (!n.Contains("gpslocator") && !n.Contains("gpsmarker") && !n.Contains("gpspin")) continue;
+                if (n.Contains("<") || n.Contains("__")) continue;
+                if (++total > 40) return;
+                sb.AppendLine($"== {an} {t.FullName}");
+                DumpMembers(sb, t);
+            }
+        }
+    }
+
+    private static void DumpMembers(StringBuilder sb, Type t)
+    {
+        sb.AppendLine($"   [{t.FullName}] properties");
+        foreach (var p in t.GetProperties(BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly).Take(80))
+            sb.AppendLine($"     {p.PropertyType.Name} {p.Name}");
+        sb.AppendLine($"   [{t.FullName}] methods");
+        foreach (var m in t.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly)
+                     .Where(m => !m.IsSpecialName && !m.Name.Contains("NativeMethodInfoPtr")).Take(80))
+        {
+            var ps = string.Join(", ", m.GetParameters().Select(x => $"{x.ParameterType.Name} {x.Name}"));
+            sb.AppendLine($"     {(m.IsStatic ? "static " : "")}{m.ReturnType.Name} {m.Name}({ps})");
+        }
+    }
+
+    private static string Components(Transform t)
+    {
+        var names = new List<string>();
+        foreach (var c in t.GetComponents<Component>())
+            if (c) names.Add(c.GetIl2CppType().Name);
+        return string.Join(", ", names);
+    }
+
+    private static string PathOf(Transform t)
+    {
+        var parts = new List<string>();
+        for (var i = 0; t && i < 10; i++, t = t.parent)
+            parts.Insert(0, t.name);
+        return string.Join("/", parts);
+    }
+
+    private static string V3(Vector3 v) => $"({v.x:F1}, {v.y:F1}, {v.z:F1})";
 }
