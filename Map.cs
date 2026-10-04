@@ -1,0 +1,828 @@
+using RedLoader;
+using RedLoader.Utils;
+using Sons.Ai.Vail;
+using Sons.Gameplay.GPS;
+using SonsSdk;
+using TheForest.Utils;
+using UnityEngine;
+using UnityEngine.InputSystem;
+using UnityEngine.UI;
+
+namespace Map;
+
+public class Map : SonsMod
+{
+    private const string GpsActionName = "GpsTracker";
+    private const string GpsActionMap = "default";
+    private const float ZoomStep = 1.25f;
+    private const float MaxZoom = 12f;
+    private const float ViewFraction = 0.92f;
+    private const float BackgroundAlpha = 0.85f;
+    private const float MarkerSize = 34f;
+    private const float ArrowSize = 44f;
+    private const float OtherArrowSize = 38f;
+    private const int LabelFontSize = 18;
+    private const string Kelvin = "Kelvin";
+    private const string Virginia = "Virginia";
+    private const string Player = "Player";
+    private const string Locator = "Locator";
+    private const float LocatorSize = 30f;
+    private const float HoldTime = 0.6f;
+
+    private static readonly Color YouColor = new(1f, 0.961f, 0f, 1f);
+    private static readonly Color OtherColor = new(0f, 0.85f, 1f, 1f);
+
+    private class Marker
+    {
+        public string Kind;
+        public Transform Target;
+        public RectTransform Rect;
+        public RectTransform Arrow;
+        public Text Label;
+        public string Signature;
+    }
+
+    private struct Found
+    {
+        public string Kind;
+        public Transform Target;
+        public string Name;
+        public Texture Icon;
+        public Color IconColor;
+        public Texture Outline;
+        public Color OutlineColor;
+        public bool HasBackground;
+        public Color BackgroundColor;
+        public string Signature;
+    }
+
+    private static Canvas _canvas;
+    private static RectTransform _view;
+    private static RawImage _map;
+    private static RectTransform _player;
+    private static readonly List<Marker> Markers = new();
+
+    private static Texture2D _mapTex;
+    private static Rect _mapUv = new(0f, 0f, 1f, 1f);
+    private static Vector2 _worldSize = new(2000f, 2000f);
+    private static Sprite _arrowSprite;
+    private static Font _font;
+    private static Texture _kelvinTex;
+    private static Texture _heartTex;
+    private static Texture _circleTex;
+
+    private static InputAction _gpsAction;
+    private static float _zoom = MaxZoom;
+    private static bool _open;
+    private static float _nextBindingCheck;
+    private static float _nextScan;
+    private static float _nextIconLookup;
+    private static bool _warnedBinding;
+    private static bool _warnedPlayers;
+    private static bool _warnedRescan;
+    private static bool _warnedLocators;
+    private static readonly HashSet<string> WarnedCreate = new();
+    private static string _lastSummary = string.Empty;
+    private static bool _tookM;
+    private static int _overrideIndex = -1;
+    private static bool _gpsMode;
+    private static float _mDownAt = -1f;
+    private static bool _holdHandled;
+    private static string _configPath;
+
+    public Map()
+    {
+        OnUpdateCallback = OnUpdate;
+    }
+
+    protected override void OnSdkInitialized()
+    {
+        _configPath = Path.Combine(LoaderEnvironment.UserDataDirectory, "Map.txt");
+        Load();
+        RLog.Msg($"Map loaded. M opens the {(_gpsMode ? "GPS" : "map")}, hold M to switch, scroll to zoom");
+    }
+
+    private void OnUpdate()
+    {
+        if (Time.unscaledTime >= _nextBindingCheck)
+        {
+            _nextBindingCheck = Time.unscaledTime + 1f;
+            ReleaseM();
+        }
+
+        var gameplay = _gpsAction != null && _gpsAction.enabled && LocalPlayer.Transform;
+        if (_open && !gameplay)
+        {
+            SetOpen(false);
+            return;
+        }
+
+        HandleM(gameplay);
+
+        if (!_open) return;
+
+        HandleZoom();
+
+        if (Time.unscaledTime >= _nextScan)
+        {
+            _nextScan = Time.unscaledTime + 1f;
+            try
+            {
+                Rescan();
+            }
+            catch (Exception e)
+            {
+                if (!_warnedRescan)
+                {
+                    _warnedRescan = true;
+                    RLog.Error($"Map rescan failed: {e}");
+                }
+            }
+        }
+
+        Layout();
+    }
+
+    private static void HandleM(bool gameplay)
+    {
+        var kb = Keyboard.current;
+        if (kb == null) return;
+        var key = kb.mKey;
+
+        if (key.wasPressedThisFrame)
+        {
+            _mDownAt = gameplay ? Time.unscaledTime : -1f;
+            _holdHandled = false;
+        }
+
+        if (_mDownAt >= 0f && !_holdHandled && key.isPressed && Time.unscaledTime - _mDownAt >= HoldTime)
+        {
+            _holdHandled = true;
+            SetGpsMode(!_gpsMode);
+        }
+
+        if (key.wasReleasedThisFrame)
+        {
+            var tap = _mDownAt >= 0f && !_holdHandled;
+            _mDownAt = -1f;
+            if (tap && gameplay && !_gpsMode)
+                SetOpen(!_open);
+        }
+    }
+
+    private static void SetGpsMode(bool gps)
+    {
+        _gpsMode = gps;
+        Save();
+        if (gps)
+        {
+            if (_open) SetOpen(false);
+            RestoreGpsBinding();
+        }
+        else
+        {
+            ReleaseM();
+        }
+        SonsTools.ShowMessage(gps ? "M now raises the GPS. Hold M to switch back to the map" : "M now opens the map. Hold M to switch to the GPS");
+        RLog.Msg($"Map mode: M opens the {(gps ? "GPS" : "map")}");
+    }
+
+    private static void RestoreGpsBinding()
+    {
+        try
+        {
+            if (_gpsAction == null || _overrideIndex < 0) return;
+            InputActionRebindingExtensions.RemoveBindingOverride(_gpsAction, _overrideIndex);
+            _overrideIndex = -1;
+        }
+        catch (Exception e)
+        {
+            RLog.Warning($"Map could not give M back to the GPS: {e.Message}");
+        }
+    }
+
+    private static void ReleaseM()
+    {
+        try
+        {
+            var kb = Keyboard.current;
+            if (kb == null) return;
+            var actions = InputSystem.ListEnabledActions();
+            InputAction found = null;
+            for (var i = 0; i < actions.Count; i++)
+            {
+                var a = actions[i];
+                if (a != null && a.name == GpsActionName && a.actionMap != null && a.actionMap.name == GpsActionMap)
+                {
+                    found = a;
+                    break;
+                }
+            }
+            if (found == null) return;
+            _gpsAction = found;
+            if (_gpsMode) return;
+
+            var index = InputActionRebindingExtensions.GetBindingIndexForControl(found, kb.mKey);
+            if (index < 0) return;
+            InputActionRebindingExtensions.ApplyBindingOverride(found, index, string.Empty);
+            _overrideIndex = index;
+            if (!_tookM)
+            {
+                _tookM = true;
+                RLog.Msg("Map moved M from the GPS tracker to the full map");
+            }
+        }
+        catch (Exception e)
+        {
+            if (_warnedBinding) return;
+            _warnedBinding = true;
+            RLog.Warning($"Map could not take over M: {e.Message}");
+        }
+    }
+
+    private static void Load()
+    {
+        try
+        {
+            if (!File.Exists(_configPath))
+            {
+                Save();
+                return;
+            }
+            foreach (var line in File.ReadAllLines(_configPath))
+            {
+                var i = line.IndexOf('=');
+                if (i <= 0) continue;
+                var k = line[..i].Trim();
+                var v = line[(i + 1)..].Trim();
+                if (k.Equals("Mode", StringComparison.OrdinalIgnoreCase))
+                    _gpsMode = v.Equals("Gps", StringComparison.OrdinalIgnoreCase);
+            }
+        }
+        catch (Exception e)
+        {
+            RLog.Warning($"Map config load failed: {e.Message}");
+        }
+    }
+
+    private static void Save()
+    {
+        try
+        {
+            File.WriteAllText(_configPath, $"Mode={(_gpsMode ? "Gps" : "Map")}\n");
+        }
+        catch (Exception e)
+        {
+            RLog.Warning($"Map config save failed: {e.Message}");
+        }
+    }
+
+    private static void SetOpen(bool open)
+    {
+        if (open)
+        {
+            if (!EnsureAssets())
+            {
+                SonsTools.ShowMessage("Full map is not ready yet");
+                return;
+            }
+            EnsureUi();
+            _zoom = MaxZoom;
+            _nextScan = 0f;
+        }
+        _open = open;
+        if (_canvas) _canvas.gameObject.SetActive(open);
+    }
+
+    private static void HandleZoom()
+    {
+        var mouse = Mouse.current;
+        if (mouse == null) return;
+        var y = mouse.scroll.y.ReadValue();
+        if (Mathf.Abs(y) < 0.01f) return;
+        _zoom = Mathf.Clamp(_zoom * Mathf.Pow(ZoomStep, Mathf.Sign(y)), 1f, MaxZoom);
+    }
+
+    private static bool EnsureAssets()
+    {
+        if (!_mapTex) FindMap();
+        if ((!_kelvinTex || !_heartTex || !_circleTex) && Time.unscaledTime >= _nextIconLookup)
+        {
+            _nextIconLookup = Time.unscaledTime + 10f;
+            FindIcons();
+        }
+        return _mapTex;
+    }
+
+    private static void FindMap()
+    {
+        foreach (var t in Resources.FindObjectsOfTypeAll<GPSTrackerSystem>())
+        {
+            if (!t) continue;
+            var surface = t._surfaceMap;
+            if (!surface) continue;
+            var img = surface.GetComponent<Image>();
+            if (!img) continue;
+            var sprite = img.sprite;
+            if (!sprite || !sprite.texture) continue;
+
+            _mapTex = sprite.texture;
+            var r = sprite.textureRect;
+            _mapUv = new Rect(r.x / _mapTex.width, r.y / _mapTex.height, r.width / _mapTex.width, r.height / _mapTex.height);
+            var ws = t._worldSize;
+            if (ws.x > 1f && ws.y > 1f) _worldSize = ws;
+
+            var arrow = t._playerArrow;
+            if (arrow)
+            {
+                var ai = arrow.GetComponent<Image>();
+                if (ai && ai.sprite) _arrowSprite = ai.sprite;
+            }
+
+            var day = t._dayText;
+            if (day && day.font) _font = day.font;
+
+            RLog.Msg($"Map using {_mapTex.name} {_mapTex.width}x{_mapTex.height}, map covers {_worldSize.x * 2f}x{_worldSize.y * 2f} m");
+            return;
+        }
+    }
+
+    private static void FindIcons()
+    {
+        foreach (var ri in Resources.FindObjectsOfTypeAll<RawImage>())
+        {
+            if (!ri) continue;
+            var t = ri.texture;
+            if (!t) continue;
+            switch (t.name)
+            {
+                case "RobbyLogo":
+                    if (!_kelvinTex) _kelvinTex = t;
+                    break;
+                case "HeartIcon":
+                    if (!_heartTex || _heartTex.name != "HeartIcon") _heartTex = t;
+                    break;
+                case "Heart":
+                    if (!_heartTex) _heartTex = t;
+                    break;
+                case "Circle":
+                    if (!_circleTex) _circleTex = t;
+                    break;
+            }
+        }
+        if (_canvas && _kelvinTex && _heartTex) ClearMarkers();
+    }
+
+    private static void EnsureUi()
+    {
+        if (_canvas) return;
+
+        var root = new GameObject("MapCanvas");
+        UnityEngine.Object.DontDestroyOnLoad(root);
+        _canvas = root.AddComponent<Canvas>();
+        _canvas.renderMode = RenderMode.ScreenSpaceOverlay;
+        _canvas.sortingOrder = 200;
+        var scaler = root.AddComponent<CanvasScaler>();
+        scaler.uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize;
+        scaler.referenceResolution = new Vector2(1920f, 1080f);
+        scaler.matchWidthOrHeight = 1f;
+
+        var bg = new GameObject("Background");
+        bg.transform.SetParent(root.transform, false);
+        var bgImg = bg.AddComponent<Image>();
+        bgImg.color = new Color(0f, 0f, 0f, BackgroundAlpha);
+        bgImg.raycastTarget = false;
+        Stretch(bgImg.rectTransform, 1f);
+
+        var view = new GameObject("View");
+        view.transform.SetParent(root.transform, false);
+        _view = view.AddComponent<RectTransform>();
+        _view.anchorMin = new Vector2(0.5f, 0.5f);
+        _view.anchorMax = new Vector2(0.5f, 0.5f);
+        var side = 1080f * ViewFraction;
+        _view.sizeDelta = new Vector2(side, side);
+        view.AddComponent<RectMask2D>();
+
+        var map = new GameObject("Map");
+        map.transform.SetParent(view.transform, false);
+        _map = map.AddComponent<RawImage>();
+        _map.texture = _mapTex;
+        _map.raycastTarget = false;
+        Stretch(_map.rectTransform, 1f);
+
+        _player = CreateArrow(_view, "You", ArrowSize, YouColor);
+        Markers.Clear();
+        root.SetActive(false);
+    }
+
+    private static RectTransform CreateArrow(Transform parent, string name, float size, Color color)
+    {
+        var go = new GameObject(name);
+        go.transform.SetParent(parent, false);
+        var r = go.AddComponent<RectTransform>();
+        Center(r, size);
+
+        if (_arrowSprite)
+        {
+            AddImage(go.transform, "Outline", _arrowSprite, Color.black, 1f, Vector2.zero);
+            AddImage(go.transform, "Inner", _arrowSprite, color, 0.66f, new Vector2(0f, -size * 10f / 128f));
+        }
+        else
+        {
+            AddRaw(go.transform, "Ring", _circleTex, Color.black, 1f);
+            AddRaw(go.transform, "Dot", _circleTex, color, 0.7f);
+        }
+        return r;
+    }
+
+    private static Marker CreateMarker(Found f)
+    {
+        var go = new GameObject($"Marker_{f.Kind}");
+        go.transform.SetParent(_view, false);
+        var r = go.AddComponent<RectTransform>();
+        var m = new Marker { Kind = f.Kind, Target = f.Target, Rect = r };
+
+        if (f.Kind == Locator)
+        {
+            Center(r, LocatorSize);
+            m.Signature = f.Signature;
+            if (f.HasBackground)
+            {
+                AddRaw(go.transform, "Ring", _circleTex, Color.black, 1.15f);
+                AddRaw(go.transform, "Background", _circleTex, f.BackgroundColor, 1f);
+                if (f.Icon) AddRaw(go.transform, "Icon", f.Icon, f.IconColor, 0.72f);
+            }
+            else
+            {
+                if (f.Outline) AddRaw(go.transform, "Outline", f.Outline, f.OutlineColor, 1f);
+                if (f.Icon) AddRaw(go.transform, "Icon", f.Icon, f.IconColor, 1f);
+            }
+            go.transform.SetSiblingIndex(1);
+            return m;
+        }
+
+        if (f.Kind == Player)
+        {
+            Center(r, OtherArrowSize);
+            m.Arrow = CreateArrow(go.transform, "Arrow", OtherArrowSize, OtherColor);
+            m.Label = CreateLabel(go.transform, f.Name, OtherArrowSize);
+        }
+        else
+        {
+            Center(r, MarkerSize);
+            var bg = f.Kind == Kelvin ? new Color(0f, 0f, 1f, 1f) : new Color(0.973f, 0.667f, 1f, 1f);
+            var icon = f.Kind == Kelvin ? _kelvinTex : _heartTex;
+            AddRaw(go.transform, "Ring", _circleTex, Color.black, 1.15f);
+            AddRaw(go.transform, "Background", _circleTex, bg, 1f);
+            if (icon) AddRaw(go.transform, "Icon", icon, Color.white, 0.72f);
+        }
+
+        if (_player) _player.SetAsLastSibling();
+        return m;
+    }
+
+    private static Text CreateLabel(Transform parent, string text, float markerSize)
+    {
+        if (!_font) return null;
+        var go = new GameObject("Label");
+        go.transform.SetParent(parent, false);
+        var t = go.AddComponent<Text>();
+        t.font = _font;
+        t.fontSize = LabelFontSize;
+        t.alignment = TextAnchor.LowerCenter;
+        t.horizontalOverflow = HorizontalWrapMode.Overflow;
+        t.verticalOverflow = VerticalWrapMode.Overflow;
+        t.color = Color.white;
+        t.raycastTarget = false;
+        t.text = text;
+        var outline = go.AddComponent<Outline>();
+        outline.effectColor = Color.black;
+        outline.effectDistance = new Vector2(1.5f, -1.5f);
+        var r = t.rectTransform;
+        r.anchorMin = new Vector2(0.5f, 0.5f);
+        r.anchorMax = new Vector2(0.5f, 0.5f);
+        r.sizeDelta = new Vector2(240f, 24f);
+        r.anchoredPosition = new Vector2(0f, markerSize * 0.5f + 14f);
+        return t;
+    }
+
+    private static void AddRaw(Transform parent, string name, Texture tex, Color color, float scale)
+    {
+        var go = new GameObject(name);
+        go.transform.SetParent(parent, false);
+        var img = go.AddComponent<RawImage>();
+        img.texture = tex;
+        img.color = color;
+        img.raycastTarget = false;
+        Stretch(img.rectTransform, scale);
+    }
+
+    private static void AddImage(Transform parent, string name, Sprite sprite, Color color, float scale, Vector2 offset)
+    {
+        var go = new GameObject(name);
+        go.transform.SetParent(parent, false);
+        var img = go.AddComponent<Image>();
+        img.sprite = sprite;
+        img.color = color;
+        img.raycastTarget = false;
+        Stretch(img.rectTransform, scale);
+        img.rectTransform.anchoredPosition = offset;
+    }
+
+    private static void Stretch(RectTransform r, float scale)
+    {
+        r.anchorMin = Vector2.zero;
+        r.anchorMax = Vector2.one;
+        r.offsetMin = Vector2.zero;
+        r.offsetMax = Vector2.zero;
+        r.localScale = new Vector3(scale, scale, 1f);
+    }
+
+    private static void Center(RectTransform r, float size)
+    {
+        r.anchorMin = new Vector2(0.5f, 0.5f);
+        r.anchorMax = new Vector2(0.5f, 0.5f);
+        r.sizeDelta = new Vector2(size, size);
+    }
+
+    private static void Layout()
+    {
+        var player = LocalPlayer.Transform;
+        if (!player || !_view) return;
+
+        var side = _view.rect.width;
+        var w = 1f / _zoom;
+        var p = WorldToUv(player.position);
+        var cx = Mathf.Clamp(p.x, w * 0.5f, 1f - w * 0.5f);
+        var cy = Mathf.Clamp(p.y, w * 0.5f, 1f - w * 0.5f);
+        var view = new Rect(cx - w * 0.5f, cy - w * 0.5f, w, w);
+
+        _map.uvRect = new Rect(
+            _mapUv.x + view.x * _mapUv.width,
+            _mapUv.y + view.y * _mapUv.height,
+            view.width * _mapUv.width,
+            view.height * _mapUv.height);
+
+        Place(_player, p, view, side);
+        _player.localEulerAngles = new Vector3(0f, 0f, -player.eulerAngles.y);
+
+        foreach (var m in Markers)
+        {
+            if (!m.Rect) continue;
+            if (!m.Target || !m.Target.gameObject.activeInHierarchy)
+            {
+                m.Rect.gameObject.SetActive(false);
+                continue;
+            }
+            Place(m.Rect, WorldToUv(m.Target.position), view, side);
+            if (m.Arrow) m.Arrow.localEulerAngles = new Vector3(0f, 0f, -m.Target.eulerAngles.y);
+        }
+    }
+
+    private static Vector2 WorldToUv(Vector3 world)
+    {
+        return new Vector2(world.x / (_worldSize.x * 2f) + 0.5f, world.z / (_worldSize.y * 2f) + 0.5f);
+    }
+
+    private static void Place(RectTransform r, Vector2 uv, Rect view, float side)
+    {
+        var x = (uv.x - view.x) / view.width;
+        var y = (uv.y - view.y) / view.height;
+        var inside = x >= 0f && x <= 1f && y >= 0f && y <= 1f;
+        if (r.gameObject.activeSelf != inside) r.gameObject.SetActive(inside);
+        r.anchoredPosition = new Vector2((x - 0.5f) * side, (y - 0.5f) * side);
+    }
+
+    private static void Rescan()
+    {
+        var found = new List<Found>();
+        CollectCompanions(found);
+        CollectPlayers(found);
+        CollectLocators(found);
+
+        for (var i = Markers.Count - 1; i >= 0; i--)
+        {
+            var m = Markers[i];
+            if (m.Rect && m.Target && found.Any(f => f.Target.Pointer == m.Target.Pointer && f.Kind == m.Kind && f.Signature == m.Signature)) continue;
+            if (m.Rect) UnityEngine.Object.Destroy(m.Rect.gameObject);
+            Markers.RemoveAt(i);
+        }
+
+        foreach (var f in found)
+        {
+            var existing = Markers.FirstOrDefault(m => m.Target.Pointer == f.Target.Pointer && m.Kind == f.Kind);
+            if (existing == null)
+            {
+                try
+                {
+                    Markers.Add(CreateMarker(f));
+                }
+                catch (Exception e)
+                {
+                    if (WarnedCreate.Add(f.Kind))
+                        RLog.Error($"Map could not create the {f.Kind} marker: {e}");
+                }
+                continue;
+            }
+            if (existing.Label && existing.Label.text != f.Name)
+                existing.Label.text = f.Name;
+        }
+
+        var summary = $"players {found.Count(f => f.Kind == Player)}, Kelvin {found.Count(f => f.Kind == Kelvin)}, Virginia {found.Count(f => f.Kind == Virginia)}, GPS icons {found.Count(f => f.Kind == Locator)}, markers {Markers.Count}";
+        if (summary != _lastSummary)
+        {
+            _lastSummary = summary;
+            RLog.Msg($"Map found {summary}");
+        }
+    }
+
+    private static void CollectPlayers(List<Found> found)
+    {
+        try
+        {
+            if (!BoltNetwork.isRunning) return;
+            var tracker = PlayerTracker.Instance;
+            if (tracker == null || tracker.AllPlayerEntities == null) return;
+            var local = LocalPlayer.Entity;
+            var localTransform = LocalPlayer.Transform;
+            var localRoot = localTransform ? localTransform.root : null;
+
+            foreach (var entity in tracker.AllPlayerEntities)
+            {
+                if (entity == null || !entity.gameObject) continue;
+                if (local != null && entity.Pointer == local.Pointer) continue;
+                var target = entity.transform;
+                if (!target || found.Any(f => f.Target.Pointer == target.Pointer)) continue;
+                if (localTransform && (target.Pointer == localTransform.Pointer || target.root.Pointer == localRoot.Pointer)) continue;
+                if (IsSelf(entity, localTransform)) continue;
+                found.Add(new Found { Kind = Player, Target = target, Name = GetName(entity) });
+            }
+        }
+        catch (Exception e)
+        {
+            if (_warnedPlayers) return;
+            _warnedPlayers = true;
+            RLog.Warning($"Map could not read players: {e.Message}");
+        }
+    }
+
+    private static void CollectLocators(List<Found> found)
+    {
+        try
+        {
+            GPSTrackerSystem source = null;
+            var best = 0;
+            foreach (var t in Resources.FindObjectsOfTypeAll<GPSTrackerSystem>())
+            {
+                if (!t) continue;
+                var list = t._gpsLocators;
+                var visuals = t._gpsLocatorVisuals;
+                if (list == null || visuals == null) continue;
+                var count = Math.Min(list.Count, visuals.Count);
+                if (count <= best) continue;
+                best = count;
+                source = t;
+            }
+            if (!source) return;
+
+            var locators = source._gpsLocators;
+            var visualsList = source._gpsLocatorVisuals;
+            var n = Math.Min(locators.Count, visualsList.Count);
+            for (var i = 0; i < n; i++)
+            {
+                var locator = locators[i];
+                var visual = visualsList[i];
+                if (!locator || !visual || !visual.gameObject.activeSelf) continue;
+                var target = locator.transform;
+                if (!target || found.Any(f => f.Target.Pointer == target.Pointer)) continue;
+
+                var f = new Found { Kind = Locator, Target = target, Name = Locator };
+                var iconOnly = visual.Find("IconOnly");
+                if (iconOnly && iconOnly.gameObject.activeSelf)
+                {
+                    ReadIcon(iconOnly.Find("Icon"), ref f);
+                }
+                else
+                {
+                    ReadIcon(visual.Find("Pin/Icon"), ref f);
+                    var bkg = visual.Find("Pin/IconBkg");
+                    var bkgImg = bkg ? bkg.GetComponent<Image>() : null;
+                    if (bkgImg)
+                    {
+                        f.HasBackground = true;
+                        f.BackgroundColor = bkgImg.color;
+                    }
+                }
+
+                if (!f.Icon) continue;
+                if (f.Icon.name == "RobbyLogo") continue;
+                f.Signature = $"{f.Icon.name}|{f.IconColor}|{f.HasBackground}|{f.BackgroundColor}|{(f.Outline ? f.Outline.name : "")}";
+                found.Add(f);
+            }
+        }
+        catch (Exception e)
+        {
+            if (_warnedLocators) return;
+            _warnedLocators = true;
+            RLog.Warning($"Map could not read GPS icons: {e}");
+        }
+    }
+
+    private static void ReadIcon(Transform icon, ref Found f)
+    {
+        if (!icon) return;
+        var raw = icon.GetComponent<RawImage>();
+        if (!raw || !raw.texture) return;
+        f.Icon = raw.texture;
+        f.IconColor = raw.color;
+        var outline = icon.Find("IconOutline");
+        if (!outline || !outline.gameObject.activeSelf) return;
+        var oraw = outline.GetComponent<RawImage>();
+        if (!oraw || !oraw.texture) return;
+        f.Outline = oraw.texture;
+        f.OutlineColor = oraw.color;
+    }
+
+    private static bool IsSelf(BoltEntity entity, Transform localTransform)
+    {
+        try
+        {
+            if (entity.isAttached && entity.hasControl) return true;
+        }
+        catch
+        {
+        }
+        return localTransform && (entity.transform.position - localTransform.position).sqrMagnitude < 4f;
+    }
+
+    private static string GetName(BoltEntity entity)
+    {
+        try
+        {
+            if (entity.TryFindState<IPlayerState>(out var state) && !string.IsNullOrWhiteSpace(state.name) && !state.name.Equals("Unknown", StringComparison.OrdinalIgnoreCase))
+                return state.name;
+        }
+        catch
+        {
+        }
+        return string.Empty;
+    }
+
+    private static void CollectCompanions(List<Found> found)
+    {
+        try
+        {
+            var robby = ActorTools.GetRobby();
+            if (robby) Add(found, Kelvin, robby.transform);
+        }
+        catch (Exception e)
+        {
+            RLog.Warning($"GetRobby: {e.Message}");
+        }
+
+        try
+        {
+            var virginias = ActorTools.GetActors(VailActorTypeId.Virginia);
+            if (virginias != null)
+            {
+                foreach (var v in virginias)
+                    if (v) Add(found, Virginia, v.transform);
+            }
+        }
+        catch (Exception e)
+        {
+            RLog.Warning($"GetActors Virginia: {e.Message}");
+        }
+
+        var needKelvin = !found.Any(f => f.Kind == Kelvin);
+        var needVirginia = !found.Any(f => f.Kind == Virginia);
+        if (!needKelvin && !needVirginia) return;
+
+        var roots = new HashSet<IntPtr>();
+        foreach (var a in UnityEngine.Object.FindObjectsOfType<Animator>())
+        {
+            if (!a) continue;
+            var root = a.transform.root;
+            if (!roots.Add(root.Pointer)) continue;
+            var name = root.name;
+            if (name.Contains("Creepy")) continue;
+            if (needKelvin && name.StartsWith("Robby"))
+                Add(found, Kelvin, root);
+            else if (needVirginia && name.StartsWith("Virginia"))
+                Add(found, Virginia, root);
+        }
+    }
+
+    private static void Add(List<Found> found, string kind, Transform target)
+    {
+        if (target && !found.Any(f => f.Target.Pointer == target.Pointer))
+            found.Add(new Found { Kind = kind, Target = target, Name = kind });
+    }
+
+    private static void ClearMarkers()
+    {
+        foreach (var m in Markers)
+            if (m.Rect) UnityEngine.Object.Destroy(m.Rect.gameObject);
+        Markers.Clear();
+    }
+}
