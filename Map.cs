@@ -33,6 +33,7 @@ public class Map : SonsMod
     private const string Locator = "Locator";
     private const float LocatorSize = 30f;
     private const float HoldTime = 0.6f;
+    private const string GpsTapInteraction = "tap(duration=0.45)";
     private const float WaypointSize = 30f;
     private const float WaypointLifetime = 300f;
     private const string ChatTag = "[Map] ";
@@ -120,6 +121,7 @@ public class Map : SonsMod
     private static string _lastSummary = string.Empty;
     private static bool _tookM;
     private static int _overrideIndex = -1;
+    private static int _tapIndex = -1;
     private static bool _gpsMode;
     private static float _mDownAt = -1f;
     private static bool _holdHandled;
@@ -230,8 +232,9 @@ public class Map : SonsMod
         }
         else
         {
-            ReleaseM();
+            RemoveGpsTap();
         }
+        ReleaseM();
         SonsTools.ShowMessage(gps ? "M now raises the GPS. Hold M to switch back to the map" : "M now opens the map. Hold M to switch to the GPS");
         RLog.Msg($"Map mode: M opens the {(gps ? "GPS" : "map")}");
     }
@@ -248,6 +251,31 @@ public class Map : SonsMod
         {
             RLog.Warning($"Map could not give M back to the GPS: {e.Message}");
         }
+    }
+
+    private static void RemoveGpsTap()
+    {
+        try
+        {
+            if (_gpsAction == null || _tapIndex < 0) return;
+            InputActionRebindingExtensions.RemoveBindingOverride(_gpsAction, _tapIndex);
+            _tapIndex = -1;
+        }
+        catch (Exception e)
+        {
+            RLog.Warning($"Map could not reset the GPS key: {e.Message}");
+        }
+    }
+
+    private static void ApplyGpsTap(InputAction action, Keyboard kb)
+    {
+        if (_tapIndex >= 0) return;
+        var index = InputActionRebindingExtensions.GetBindingIndexForControl(action, kb.mKey);
+        if (index < 0) return;
+        var binding = new InputBinding();
+        binding.overrideInteractions = GpsTapInteraction;
+        InputActionRebindingExtensions.ApplyBindingOverride(action, index, binding);
+        _tapIndex = index;
     }
 
     private static void ReleaseM()
@@ -268,8 +296,13 @@ public class Map : SonsMod
                 }
             }
             if (found == null) return;
+            if (_gpsAction == null || _gpsAction.Pointer != found.Pointer) _tapIndex = -1;
             _gpsAction = found;
-            if (_gpsMode) return;
+            if (_gpsMode)
+            {
+                ApplyGpsTap(found, kb);
+                return;
+            }
 
             var index = InputActionRebindingExtensions.GetBindingIndexForControl(found, kb.mKey);
             if (index < 0) return;

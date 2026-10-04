@@ -3,7 +3,7 @@
   "id": "Map",
   "name": "Map",
   "author": "JustinOros",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Press M to show the GPS map full screen, scroll to zoom, press M again to close",
   "gameVersion": "1.0.0",
   "platform": "Client",
