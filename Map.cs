@@ -35,6 +35,7 @@ public class Map : SonsMod
     private const float HoldTime = 0.6f;
     private const string GpsTapInteraction = "tap(duration=0.45)";
     private const float WaypointSize = 30f;
+    private const string WaypointIconName = "MapMarkerIcon";
     private const float WaypointLifetime = 300f;
     private const string ChatTag = "[Map] ";
     private const string SelfKey = "<self>";
@@ -710,7 +711,7 @@ public class Map : SonsMod
     private static bool EnsureAssets()
     {
         if (!_mapTex) FindMap();
-        if ((!_kelvinTex || !_heartTex || !_circleTex || !_waypointTex) && Time.unscaledTime >= _nextIconLookup)
+        if ((!_kelvinTex || !_heartTex || !_circleTex || !_waypointTex || _waypointTex.name != WaypointIconName) && Time.unscaledTime >= _nextIconLookup)
         {
             _nextIconLookup = Time.unscaledTime + 10f;
             FindIcons();
@@ -751,8 +752,41 @@ public class Map : SonsMod
         }
     }
 
+    private static void FindWaypointIcon()
+    {
+        try
+        {
+            foreach (var icons in Resources.FindObjectsOfTypeAll<GPSLocatorIcons>())
+            {
+                if (!icons) continue;
+                var list = icons.IconDataList;
+                if (list == null) continue;
+                for (var i = 0; i < list.Count; i++)
+                {
+                    object item = list[i];
+                    if (item == null) continue;
+                    foreach (var p in item.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
+                    {
+                        if (!typeof(Texture).IsAssignableFrom(p.PropertyType)) continue;
+                        Texture tex;
+                        try { tex = p.GetValue(item) as Texture; }
+                        catch { continue; }
+                        if (!tex || tex.name != WaypointIconName) continue;
+                        _waypointTex = tex;
+                        return;
+                    }
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            RLog.Warning($"Map could not read the GPS icon list: {e.Message}");
+        }
+    }
+
     private static void FindIcons()
     {
+        FindWaypointIcon();
         foreach (var ri in Resources.FindObjectsOfTypeAll<RawImage>())
         {
             if (!ri) continue;
@@ -772,11 +806,8 @@ public class Map : SonsMod
                 case "Circle":
                     if (!_circleTex) _circleTex = t;
                     break;
-                case "MapMarkerIcon":
+                case WaypointIconName:
                     _waypointTex = t;
-                    break;
-                case "CrossIcon":
-                    if (!_waypointTex) _waypointTex = t;
                     break;
             }
         }
