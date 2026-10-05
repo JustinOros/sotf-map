@@ -2,7 +2,6 @@ using RedLoader;
 using System.Globalization;
 using System.Reflection;
 using System.Text.RegularExpressions;
-using HarmonyLib;
 using RedLoader.Utils;
 using Sons.Ai.Vail;
 using Sons.Gameplay.GPS;
@@ -134,6 +133,9 @@ public class Map : SonsMod
     private static ChatBox _chat;
     private static Rect _lastView = new(0f, 0f, 1f, 1f);
     private static bool _warnedChat;
+    private static float _nextChatPoll;
+    private static float _nextChatLookup;
+    private static readonly Dictionary<IntPtr, string> SeenRows = new();
     private static bool _warnedBlock;
 
     public Map()
@@ -145,7 +147,6 @@ public class Map : SonsMod
     {
         _configPath = Path.Combine(LoaderEnvironment.UserDataDirectory, "Map.txt");
         Load();
-        PatchChat();
         RLog.Msg($"Map loaded. M opens the {(_gpsMode ? "GPS" : "map")}, hold M to switch, scroll to zoom");
     }
 
@@ -158,6 +159,7 @@ public class Map : SonsMod
         }
 
         var gameplay = _gpsAction != null && _gpsAction.enabled && LocalPlayer.Transform;
+        PollChat();
         UpdateWaypoints();
 
         if (_open && !gameplay)
@@ -491,20 +493,65 @@ public class Map : SonsMod
         Waypoints.Remove(key);
     }
 
+    private static void FindChat()
+    {
+        if (_chat || Time.unscaledTime < _nextChatLookup) return;
+        _nextChatLookup = Time.unscaledTime + 2f;
+        foreach (var c in Resources.FindObjectsOfTypeAll<ChatBox>())
+        {
+            if (!c || !c.gameObject.scene.isLoaded) continue;
+            _chat = c;
+            SeenRows.Clear();
+            break;
+        }
+    }
+
+    private static void PollChat()
+    {
+        if (Time.unscaledTime < _nextChatPoll) return;
+        _nextChatPoll = Time.unscaledTime + 0.2f;
+        try
+        {
+            if (!BoltNetwork.isRunning) return;
+            FindChat();
+            if (!_chat) return;
+            var holder = _chat._messages;
+            if (!holder) return;
+            var parent = holder.transform;
+            for (var i = 0; i < parent.childCount; i++)
+            {
+                var child = parent.GetChild(i);
+                if (!child || !child.gameObject.activeSelf) continue;
+                var row = child.GetComponent<ChatMessageRow>();
+                if (!row) continue;
+                var label = row._message;
+                if (!label) continue;
+                var text = label.text;
+                if (string.IsNullOrEmpty(text)) continue;
+                if (SeenRows.TryGetValue(child.Pointer, out var seen) && seen == text) continue;
+                SeenRows[child.Pointer] = text;
+                var at = text.IndexOf(ChatTag, StringComparison.Ordinal);
+                if (at < 0) continue;
+                child.gameObject.SetActive(false);
+                HandleChat(text.Substring(at + ChatTag.Length).Trim());
+            }
+            if (SeenRows.Count > 200) SeenRows.Clear();
+        }
+        catch (Exception e)
+        {
+            if (_warnedChat) return;
+            _warnedChat = true;
+            RLog.Warning($"Map could not read chat: {e.Message}");
+        }
+    }
+
     private static void Broadcast(string line)
     {
         try
         {
             if (!BoltNetwork.isRunning) return;
-            if (!_chat)
-            {
-                foreach (var c in Resources.FindObjectsOfTypeAll<ChatBox>())
-                {
-                    if (!c || !c.gameObject.scene.isLoaded) continue;
-                    _chat = c;
-                    break;
-                }
-            }
+            _nextChatLookup = 0f;
+            FindChat();
             if (!_chat)
             {
                 if (!_warnedChat)
@@ -519,38 +566,6 @@ public class Map : SonsMod
         catch (Exception e)
         {
             RLog.Warning($"Map could not send the waypoint: {e.Message}");
-        }
-    }
-
-    private static void PatchChat()
-    {
-        try
-        {
-            var harmony = new HarmonyLib.Harmony("JustinOros.Map");
-            var target = AccessTools.Method(typeof(ChatBox), "AddLine");
-            var prefix = typeof(Map).GetMethod(nameof(AddLinePrefix), BindingFlags.NonPublic | BindingFlags.Static);
-            harmony.Patch(target, new HarmonyMethod(prefix));
-        }
-        catch (Exception e)
-        {
-            RLog.Warning($"Map could not hook chat, shared waypoints are off: {e.Message}");
-        }
-    }
-
-    private static bool AddLinePrefix(string message)
-    {
-        try
-        {
-            if (string.IsNullOrEmpty(message)) return true;
-            var i = message.IndexOf(ChatTag, StringComparison.Ordinal);
-            if (i < 0) return true;
-            HandleChat(message.Substring(i + ChatTag.Length).Trim());
-            return false;
-        }
-        catch (Exception e)
-        {
-            RLog.Warning($"Map could not read a waypoint message: {e.Message}");
-            return true;
         }
     }
 
