@@ -1015,7 +1015,9 @@ public class Map : SonsMod
                 var tp = label.GetType().GetProperty("text");
                 var value = tp?.GetValue(label) as string;
                 if (string.IsNullOrWhiteSpace(value)) continue;
-                parts.Add(value.Trim());
+                value = value.Trim();
+                if (n.Contains("day") && value.Length > 0 && char.IsDigit(value[0])) value = $"Day {value}";
+                parts.Add(value);
                 names.Add(p.Name);
             }
             if (parts.Count == 0) continue;
