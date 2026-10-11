@@ -8,6 +8,9 @@ yellow arrow, other players are blue arrows with their names, Kelvin is his K
 and Virginia is her heart. Everything your GPS shows is on the map too, such as
 discovered caves, GPS locators and other points of interest.
 
+The top left corner of the map shows the current day and time of day, the same
+as the GPS.
+
 ## Waypoints
 
 While the map is open the mouse cursor is free. Left click anywhere on the map to
