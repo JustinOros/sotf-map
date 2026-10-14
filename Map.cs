@@ -40,7 +40,7 @@ public class Map : SonsMod
     private const string SelfKey = "<self>";
     private static readonly Regex SetRx = new(@"^(.+?) set a waypoint at (-?\d+), (-?\d+)");
     private static readonly Regex ClearRx = new(@"^(.+?) cleared the waypoint");
-    private static readonly string[] BlockedActions = { "MouseX", "MouseY", "PrimaryAction", "SecondaryAction" };
+    private static readonly string[] BlockedActions = { "MouseX", "MouseY", "PrimaryAction", "SecondaryAction", "TogglePauseMenu", "Back" };
     private static readonly Color[] Palette =
     {
         new(1f, 0.25f, 0.25f, 1f),
@@ -137,9 +137,12 @@ public class Map : SonsMod
     private static float _nextChatLookup;
     private static readonly Dictionary<IntPtr, string> SeenRows = new();
     private static bool _warnedBlock;
-    private static Text _clock;
-    private static float _nextClock;
-    private static bool _loggedClock;
+    private static bool _waitEscRelease;
+    private static Text _dayLabel;
+    private static Text _gpsDay;
+    private static float _nextDay;
+    private static float _nextDayLookup;
+    private static bool _warnedDay;
 
     public Map()
     {
@@ -171,6 +174,20 @@ public class Map : SonsMod
             return;
         }
 
+        var keyboard = Keyboard.current;
+        if (_waitEscRelease && (keyboard == null || !keyboard.escapeKey.isPressed))
+        {
+            _waitEscRelease = false;
+            BlockInput(false);
+        }
+
+        if (_open && keyboard != null && keyboard.escapeKey.wasPressedThisFrame)
+        {
+            _waitEscRelease = true;
+            SetOpen(false);
+            return;
+        }
+
         HandleM(gameplay);
 
         if (!_open) return;
@@ -198,7 +215,7 @@ public class Map : SonsMod
         }
 
         Layout();
-        UpdateClock();
+        UpdateDay();
     }
 
     private static void HandleM(bool gameplay)
@@ -381,7 +398,7 @@ public class Map : SonsMod
         }
         if (_open != open)
         {
-            BlockInput(open);
+            if (open || !_waitEscRelease) BlockInput(open);
             if (!open && restoreCursor)
             {
                 Cursor.lockState = CursorLockMode.Locked;
@@ -398,12 +415,12 @@ public class Map : SonsMod
         {
             if (block)
             {
-                Blocked.Clear();
+                _waitEscRelease = false;
                 var actions = InputSystem.ListEnabledActions();
                 for (var i = 0; i < actions.Count; i++)
                 {
                     var a = actions[i];
-                    if (a != null && a.actionMap != null && a.actionMap.name == GpsActionMap && BlockedActions.Contains(a.name))
+                    if (a != null && a.actionMap != null && a.actionMap.name == GpsActionMap && BlockedActions.Contains(a.name) && !Blocked.Any(b => b.Pointer == a.Pointer))
                         Blocked.Add(a);
                 }
                 foreach (var a in Blocked) a.Disable();
@@ -878,8 +895,8 @@ public class Map : SonsMod
         Stretch(_map.rectTransform, 1f);
 
         _player = CreateArrow(_view, "You", ArrowSize, YouColor);
-        _clock = CreateClock(root.transform);
-        _nextClock = 0f;
+        _dayLabel = CreateDayLabel(root.transform);
+        _nextDay = 0f;
         Markers.Clear();
         root.SetActive(false);
     }
@@ -950,10 +967,10 @@ public class Map : SonsMod
         return m;
     }
 
-    private static Text CreateClock(Transform root)
+    private static Text CreateDayLabel(Transform root)
     {
         if (!_font) return null;
-        var go = new GameObject("Clock");
+        var go = new GameObject("Day");
         go.transform.SetParent(root, false);
         var t = go.AddComponent<Text>();
         t.font = _font;
@@ -971,67 +988,41 @@ public class Map : SonsMod
         r.anchorMin = new Vector2(0.5f, 0.5f);
         r.anchorMax = new Vector2(0.5f, 0.5f);
         r.pivot = new Vector2(0f, 1f);
-        r.sizeDelta = new Vector2(400f, 80f);
+        r.sizeDelta = new Vector2(300f, 40f);
         r.anchoredPosition = new Vector2(-half + 14f, half - 10f);
         return t;
     }
 
-    private static void UpdateClock()
+    private static void UpdateDay()
     {
-        if (!_clock || Time.unscaledTime < _nextClock) return;
-        _nextClock = Time.unscaledTime + 0.5f;
+        if (!_dayLabel || Time.unscaledTime < _nextDay) return;
+        _nextDay = Time.unscaledTime + 2f;
         try
         {
-            var text = ReadGpsClock();
-            if (_clock.text != text) _clock.text = text;
+            if (!_gpsDay && Time.unscaledTime >= _nextDayLookup)
+            {
+                _nextDayLookup = Time.unscaledTime + 10f;
+                foreach (var t in Resources.FindObjectsOfTypeAll<GPSTrackerSystem>())
+                {
+                    if (!t) continue;
+                    var d = t._dayText;
+                    if (!d || string.IsNullOrWhiteSpace(d.text)) continue;
+                    _gpsDay = d;
+                    if (t.gameObject.activeInHierarchy) break;
+                }
+            }
+            if (!_gpsDay) return;
+            var value = _gpsDay.text?.Trim() ?? string.Empty;
+            var text = value.Length > 0 && char.IsDigit(value[0]) ? $"Day {value}" : value;
+            if (_dayLabel.text != text) _dayLabel.text = text;
         }
         catch (Exception e)
         {
-            if (_loggedClock) return;
-            _loggedClock = true;
-            RLog.Warning($"Map could not read the day and time: {e.Message}");
+            _gpsDay = null;
+            if (_warnedDay) return;
+            _warnedDay = true;
+            RLog.Warning($"Map could not read the day: {e.Message}");
         }
-    }
-
-    private static string ReadGpsClock()
-    {
-        string best = string.Empty;
-        var bestScore = -1;
-        foreach (var t in Resources.FindObjectsOfTypeAll<GPSTrackerSystem>())
-        {
-            if (!t) continue;
-            var parts = new List<string>();
-            var names = new List<string>();
-            foreach (var p in typeof(GPSTrackerSystem).GetProperties(BindingFlags.Public | BindingFlags.Instance))
-            {
-                var n = p.Name.ToLowerInvariant();
-                if (!n.Contains("day") && !n.Contains("time") && !n.Contains("clock") && !n.Contains("hour")) continue;
-                var pt = p.PropertyType;
-                if (!typeof(Text).IsAssignableFrom(pt) && !pt.Name.Contains("TMP") && !pt.Name.Contains("TextMesh")) continue;
-                object label;
-                try { label = p.GetValue(t); }
-                catch { continue; }
-                if (label == null) continue;
-                var tp = label.GetType().GetProperty("text");
-                var value = tp?.GetValue(label) as string;
-                if (string.IsNullOrWhiteSpace(value)) continue;
-                value = value.Trim();
-                if (n.Contains("day") && value.Length > 0 && char.IsDigit(value[0])) value = $"Day {value}";
-                parts.Add(value);
-                names.Add(p.Name);
-            }
-            if (parts.Count == 0) continue;
-            var score = parts.Count * 2 + (t.gameObject.activeInHierarchy ? 1 : 0);
-            if (score <= bestScore) continue;
-            bestScore = score;
-            best = string.Join("   ", parts);
-            if (!_loggedClock)
-            {
-                _loggedClock = true;
-                RLog.Msg($"Map clock from {string.Join(", ", names)}: {best}");
-            }
-        }
-        return best;
     }
 
     private static Text CreateLabel(Transform parent, string text, float markerSize)

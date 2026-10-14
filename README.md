@@ -8,8 +8,7 @@ yellow arrow, other players are blue arrows with their names, Kelvin is his K
 and Virginia is her heart. Everything your GPS shows is on the map too, such as
 discovered caves, GPS locators and other points of interest.
 
-The top left corner of the map shows the current day and time of day, the same
-as the GPS.
+The top left corner of the map shows the current day, the same as the GPS.
 
 ## Waypoints
 
@@ -85,6 +84,7 @@ Run the installer again. It replaces the old version.
 | Input | What it does |
 | --- | --- |
 | `M` | Opens and closes the full map |
+| `Esc` | Closes the map without opening the pause menu |
 | Hold `M` | Switches M between the map and the GPS |
 | Left click on the map | Sets your waypoint, or clears it if you click it |
 | Right click on the map | Clears your waypoint |
